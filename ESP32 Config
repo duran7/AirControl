@@ -1,0 +1,232 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEClient.h>
+#include <ArduinoJson.h>
+
+// ==========================================
+// НАЛАШТУВАННЯ МЕРЕЖІ ТА MQTT
+// ==========================================
+const char* WIFI_SSID     = "";
+const char* WIFI_PASS     = "";
+const char* MQTT_SERVER   = "192.168.0.103"; // IP вашого LXC Mosquitto
+const int   MQTT_PORT     = 1883;
+const char* MQTT_USER     = "envi";
+const char* MQTT_PASSWORD = "";
+const char* MQTT_TOPIC    = "bluetti/ac200pl/state";
+
+// ==========================================
+// НАЛАШТУВАННЯ BLE BLUETTI
+// ==========================================
+static String bluetti_mac = ""; // MAC-адреса вашої AC200PL
+
+static BLEUUID SERVICE_UUID("0000ff00-0000-1000-8000-00805f9b34fb");
+static BLEUUID CHAR_NOTIFY_UUID("0000ff01-0000-1000-8000-00805f9b34fb");
+static BLEUUID CHAR_WRITE_UUID("0000ff02-0000-1000-8000-00805f9b34fb");
+
+// ==========================================
+// СЛУЖБОВІ ОБ'ЄКТИ ТА БУФЕРИ
+// ==========================================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+BLEClient* pBleClient = nullptr;
+BLERemoteCharacteristic* pWriteChar = nullptr;
+BLERemoteCharacteristic* pNotifyChar = nullptr;
+
+bool bleConnected = false;
+unsigned long lastBleAttempt = 0;
+unsigned long lastPoll = 0;
+
+// Буфер для збирання розірваних BLE MTU пакетів
+static uint8_t bleBuffer[128];
+static size_t bleBufferLen = 0;
+
+// Розрахунок контрольної суми Modbus RTU CRC16
+uint16_t calculateCRC(const uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++) {
+      if (crc & 0x0001) {
+        crc = (crc >> 1) ^ 0xA001;
+      } else {
+        crc = crc >> 1;
+      }
+    }
+  }
+  return crc;
+}
+
+// Безпечна відправка Modbus команди читання
+void sendModbusRead(uint8_t devId, uint8_t func, uint16_t startReg, uint16_t count) {
+  if (pWriteChar == nullptr) return;
+
+  uint8_t frame[8];
+  frame[0] = devId;
+  frame[1] = func;
+  frame[2] = (startReg >> 8) & 0xFF;
+  frame[3] = startReg & 0xFF;
+  frame[4] = (count >> 8) & 0xFF;
+  frame[5] = count & 0xFF;
+
+  uint16_t crc = calculateCRC(frame, 6);
+  frame[6] = crc & 0xFF;        // CRC Low
+  frame[7] = (crc >> 8) & 0xFF; // CRC High
+
+  pWriteChar->writeValue(frame, sizeof(frame), false);
+}
+
+// Callback обробки та склеювання відповідей BLE
+static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+  // Якщо пакет починається як нова відповідь Modbus (DevID 0x01, Func 0x03)
+  if (length >= 3 && pData[0] == 0x01 && pData[1] == 0x03) {
+    bleBufferLen = 0;
+  }
+
+  // Додаємо шматок у загальний буфер
+  if (bleBufferLen + length <= sizeof(bleBuffer)) {
+    memcpy(bleBuffer + bleBufferLen, pData, length);
+    bleBufferLen += length;
+  }
+
+  // Мінімальний заголовок: DevID(1) + Func(1) + ByteCount(1)
+  if (bleBufferLen < 3) return;
+  size_t expectedLen = 3 + bleBuffer[2] + 2; // + 2 байти CRC
+
+  // Коли зібрали повний кадр
+  if (bleBufferLen >= expectedLen) {
+    Serial.print("[BLE FULL FRAME] ");
+    for (size_t i = 0; i < bleBufferLen; i++) {
+      if (bleBuffer[i] < 16) Serial.print("0");
+      Serial.print(bleBuffer[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+
+    // 1. Рівень заряду батареї (байти 25-26)
+    uint8_t battery_soc = (bleBuffer[25] << 8) | bleBuffer[26];
+
+    // 2. Вихідна потужність AC 220V у Вт (байти 15-16, пряме ціле число)
+    uint16_t ac_output_power = (bleBuffer[15] << 8) | bleBuffer[16];
+
+    // 3. Вхідна потужність мережі 220V (AC Input Power)
+    // Коли мережа з'явиться, значення підніметься у байтах 11-12 або 13-14
+    uint16_t ac_input_power = (bleBuffer[11] << 8) | bleBuffer[12];
+    if (ac_input_power == 0) {
+      ac_input_power = (bleBuffer[13] << 8) | bleBuffer[14];
+    }
+
+    // 4. Фіксація наявності світла: якщо вхідна потужність > 10 Вт
+    bool grid_online = (ac_input_power > 10);
+
+    // Формування JSON для відправки в Mosquitto
+    StaticJsonDocument<256> doc;
+    doc["grid_online"]   = grid_online;
+    doc["grid_power_w"]  = ac_input_power;
+    doc["battery_soc"]   = battery_soc;
+    doc["ac_output_w"]   = ac_output_power;
+
+    char buffer[256];
+    serializeJson(doc, buffer);
+    mqttClient.publish(MQTT_TOPIC, buffer);
+    Serial.printf("[MQTT Sent] %s\n", buffer);
+
+    bleBufferLen = 0; // Скидаємо буфер для наступного кадру
+  }
+}
+
+// Підключення до станції по BLE
+bool connectToBluetti() {
+  Serial.printf("[BLE] Connecting to MAC: %s ...\n", bluetti_mac.c_str());
+  
+  if (pBleClient == nullptr) {
+    pBleClient = BLEDevice::createClient();
+  }
+
+  BLEAddress pAddress(bluetti_mac.c_str());
+  if (!pBleClient->connect(pAddress)) {
+    Serial.println("[BLE] Failed to connect (station busy or out of range)");
+    return false;
+  }
+
+  BLERemoteService* pRemoteService = pBleClient->getService(SERVICE_UUID);
+  if (pRemoteService == nullptr) {
+    Serial.println("[BLE] Service UUID not found");
+    pBleClient->disconnect();
+    return false;
+  }
+
+  pNotifyChar = pRemoteService->getCharacteristic(CHAR_NOTIFY_UUID);
+  pWriteChar = pRemoteService->getCharacteristic(CHAR_WRITE_UUID);
+
+  if (pNotifyChar == nullptr || pWriteChar == nullptr) {
+    Serial.println("[BLE] Characteristics not found");
+    pBleClient->disconnect();
+    return false;
+  }
+
+  if (pNotifyChar->canNotify()) {
+    pNotifyChar->registerForNotify(notifyCallback);
+  }
+
+  Serial.println("[BLE] Connected to Bluetti successfully!");
+  return true;
+}
+
+// Підключення та підтримка зв'язку з MQTT
+void ensureMqttConnected() {
+  while (!mqttClient.connected()) {
+    Serial.print("[MQTT] Connecting to broker...");
+    if (mqttClient.connect("ESP32_Bluetti", MQTT_USER, MQTT_PASSWORD)) {
+      Serial.println(" OK!");
+      mqttClient.publish("bluetti/bridge/status", "online");
+    } else {
+      Serial.printf(" FAILED, rc=%d. Retrying in 3s...\n", mqttClient.state());
+      delay(3000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[WiFi] Connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" Connected!");
+
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  ensureMqttConnected();
+
+  Serial.println("[BLE] Initializing stack...");
+  BLEDevice::init("ESP32-Bluetti");
+}
+
+void loop() {
+  // 1. MQTT обробник
+  if (!mqttClient.connected()) {
+    ensureMqttConnected();
+  }
+  mqttClient.loop();
+
+  // 2. BLE підключення при обриві зв'язку
+  if (!bleConnected || (pBleClient != nullptr && !pBleClient->isConnected())) {
+    bleConnected = false;
+    if (millis() - lastBleAttempt > 5000) {
+      lastBleAttempt = millis();
+      bleConnected = connectToBluetti();
+    }
+    return;
+  }
+
+  // 3. Запит стану станції кожні 3 секунди (14 регістрів починаючи з 0x0020)
+  if (millis() - lastPoll > 3000) {
+    lastPoll = millis();
+    sendModbusRead(0x01, 0x03, 0x0020, 0x000E);
+  }
+}
