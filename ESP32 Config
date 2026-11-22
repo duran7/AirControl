@@ -5,10 +5,11 @@
 #include <BLEClient.h>
 #include <ArduinoJson.h>
 
+
 // ==========================================
 // НАЛАШТУВАННЯ МЕРЕЖІ ТА MQTT
 // ==========================================
-const char* WIFI_SSID     = "";
+const char* WIFI_SSID     = "Duranobolon24";
 const char* WIFI_PASS     = "";
 const char* MQTT_SERVER   = "192.168.0.103"; // IP вашого LXC Mosquitto
 const int   MQTT_PORT     = 1883;
@@ -16,14 +17,17 @@ const char* MQTT_USER     = "envi";
 const char* MQTT_PASSWORD = "";
 const char* MQTT_TOPIC    = "bluetti/ac200pl/state";
 
+
 // ==========================================
 // НАЛАШТУВАННЯ BLE BLUETTI
 // ==========================================
-static String bluetti_mac = ""; // MAC-адреса вашої AC200PL
+static String bluetti_mac = "1c:69:20:ca:da:d2"; // MAC-адреса вашої AC200PL
+
 
 static BLEUUID SERVICE_UUID("0000ff00-0000-1000-8000-00805f9b34fb");
 static BLEUUID CHAR_NOTIFY_UUID("0000ff01-0000-1000-8000-00805f9b34fb");
 static BLEUUID CHAR_WRITE_UUID("0000ff02-0000-1000-8000-00805f9b34fb");
+
 
 // ==========================================
 // СЛУЖБОВІ ОБ'ЄКТИ ТА БУФЕРИ
@@ -34,13 +38,24 @@ BLEClient* pBleClient = nullptr;
 BLERemoteCharacteristic* pWriteChar = nullptr;
 BLERemoteCharacteristic* pNotifyChar = nullptr;
 
+
 bool bleConnected = false;
 unsigned long lastBleAttempt = 0;
 unsigned long lastPoll = 0;
 
+
 // Буфер для збирання розірваних BLE MTU пакетів
 static uint8_t bleBuffer[128];
 static size_t bleBufferLen = 0;
+
+
+// Змінні для збереження останніх значень між опитуваннями
+uint8_t pollStep = 0;
+uint8_t last_battery_soc = 0;
+uint16_t last_ac_output_w = 0;
+uint16_t last_ac_input_w = 0;
+float last_ac_input_v = 0.0;
+
 
 // Розрахунок контрольної суми Modbus RTU CRC16
 uint16_t calculateCRC(const uint8_t *data, size_t length) {
@@ -58,9 +73,11 @@ uint16_t calculateCRC(const uint8_t *data, size_t length) {
   return crc;
 }
 
+
 // Безпечна відправка Modbus команди читання
 void sendModbusRead(uint8_t devId, uint8_t func, uint16_t startReg, uint16_t count) {
   if (pWriteChar == nullptr) return;
+
 
   uint8_t frame[8];
   frame[0] = devId;
@@ -70,12 +87,15 @@ void sendModbusRead(uint8_t devId, uint8_t func, uint16_t startReg, uint16_t cou
   frame[4] = (count >> 8) & 0xFF;
   frame[5] = count & 0xFF;
 
+
   uint16_t crc = calculateCRC(frame, 6);
   frame[6] = crc & 0xFF;        // CRC Low
   frame[7] = (crc >> 8) & 0xFF; // CRC High
 
+
   pWriteChar->writeValue(frame, sizeof(frame), false);
 }
+
 
 // Callback обробки та склеювання відповідей BLE
 static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
@@ -84,15 +104,18 @@ static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     bleBufferLen = 0;
   }
 
+
   // Додаємо шматок у загальний буфер
   if (bleBufferLen + length <= sizeof(bleBuffer)) {
     memcpy(bleBuffer + bleBufferLen, pData, length);
     bleBufferLen += length;
   }
 
+
   // Мінімальний заголовок: DevID(1) + Func(1) + ByteCount(1)
   if (bleBufferLen < 3) return;
   size_t expectedLen = 3 + bleBuffer[2] + 2; // + 2 байти CRC
+
 
   // Коли зібрали повний кадр
   if (bleBufferLen >= expectedLen) {
@@ -104,37 +127,54 @@ static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     }
     Serial.println();
 
-    // 1. Рівень заряду батареї (байти 25-26)
-    uint8_t battery_soc = (bleBuffer[25] << 8) | bleBuffer[26];
 
-    // 2. Вихідна потужність AC 220V у Вт (байти 15-16, пряме ціле число)
-    uint16_t ac_output_power = (bleBuffer[15] << 8) | bleBuffer[16];
+    // Крок 0: Відповідь на базовий блок (14 регістрів = 28 байт даних)
+    if (bleBuffer[2] == 28) {
+      // 1. Рівень заряду батареї (байти 25-26)
+      last_battery_soc = (bleBuffer[25] << 8) | bleBuffer[26];
 
-    // 3. Вхідна потужність мережі 220V (AC Input Power)
-    // Коли мережа з'явиться, значення підніметься у байтах 11-12 або 13-14
-    uint16_t ac_input_power = (bleBuffer[11] << 8) | bleBuffer[12];
-    if (ac_input_power == 0) {
-      ac_input_power = (bleBuffer[13] << 8) | bleBuffer[14];
+
+      // 2. Вихідна потужність AC 220V у Вт (байти 15-16)
+      last_ac_output_w = (bleBuffer[15] << 8) | bleBuffer[16];
+
+
+      // 3. Вхідна потужність мережі 220V (байти 11-12 або 13-14)
+      last_ac_input_w = (bleBuffer[11] << 8) | bleBuffer[12];
+      if (last_ac_input_w == 0) {
+        last_ac_input_w = (bleBuffer[13] << 8) | bleBuffer[14];
+      }
+    }
+    // Крок 1: Відповідь на блок напруги (6 регістрів з 0x004A = 12 байт даних)
+    else if (bleBuffer[2] == 12) {
+      // Регістр 0x004D (байти 9-10, множник 0.1 В)
+      uint16_t raw_voltage = (bleBuffer[9] << 8) | bleBuffer[10];
+      last_ac_input_v = raw_voltage / 10.0;
     }
 
-    // 4. Фіксація наявності світла: якщо вхідна потужність > 10 Вт
-    bool grid_online = (ac_input_power > 10);
+
+    // 4. Фіксація наявності світла за реальною вхідною напругою (> 150 В)
+    bool grid_online = (last_ac_input_v > 150.0);
+
 
     // Формування JSON для відправки в Mosquitto
     StaticJsonDocument<256> doc;
-    doc["grid_online"]   = grid_online;
-    doc["grid_power_w"]  = ac_input_power;
-    doc["battery_soc"]   = battery_soc;
-    doc["ac_output_w"]   = ac_output_power;
+    doc["grid_online"]      = grid_online;
+    doc["ac_input_voltage"] = last_ac_input_v;
+    doc["grid_power_w"]     = last_ac_input_w;
+    doc["battery_soc"]      = last_battery_soc;
+    doc["ac_output_w"]      = last_ac_output_w;
+
 
     char buffer[256];
     serializeJson(doc, buffer);
     mqttClient.publish(MQTT_TOPIC, buffer);
     Serial.printf("[MQTT Sent] %s\n", buffer);
 
+
     bleBufferLen = 0; // Скидаємо буфер для наступного кадру
   }
 }
+
 
 // Підключення до станції по BLE
 bool connectToBluetti() {
@@ -144,11 +184,13 @@ bool connectToBluetti() {
     pBleClient = BLEDevice::createClient();
   }
 
+
   BLEAddress pAddress(bluetti_mac.c_str());
   if (!pBleClient->connect(pAddress)) {
     Serial.println("[BLE] Failed to connect (station busy or out of range)");
     return false;
   }
+
 
   BLERemoteService* pRemoteService = pBleClient->getService(SERVICE_UUID);
   if (pRemoteService == nullptr) {
@@ -157,8 +199,10 @@ bool connectToBluetti() {
     return false;
   }
 
+
   pNotifyChar = pRemoteService->getCharacteristic(CHAR_NOTIFY_UUID);
   pWriteChar = pRemoteService->getCharacteristic(CHAR_WRITE_UUID);
+
 
   if (pNotifyChar == nullptr || pWriteChar == nullptr) {
     Serial.println("[BLE] Characteristics not found");
@@ -166,13 +210,16 @@ bool connectToBluetti() {
     return false;
   }
 
+
   if (pNotifyChar->canNotify()) {
     pNotifyChar->registerForNotify(notifyCallback);
   }
 
+
   Serial.println("[BLE] Connected to Bluetti successfully!");
   return true;
 }
+
 
 // Підключення та підтримка зв'язку з MQTT
 void ensureMqttConnected() {
@@ -188,9 +235,11 @@ void ensureMqttConnected() {
   }
 }
 
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("[WiFi] Connecting");
@@ -200,12 +249,15 @@ void setup() {
   }
   Serial.println(" Connected!");
 
+
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   ensureMqttConnected();
+
 
   Serial.println("[BLE] Initializing stack...");
   BLEDevice::init("ESP32-Bluetti");
 }
+
 
 void loop() {
   // 1. MQTT обробник
@@ -213,6 +265,7 @@ void loop() {
     ensureMqttConnected();
   }
   mqttClient.loop();
+
 
   // 2. BLE підключення при обриві зв'язку
   if (!bleConnected || (pBleClient != nullptr && !pBleClient->isConnected())) {
@@ -224,9 +277,16 @@ void loop() {
     return;
   }
 
-  // 3. Запит стану станції кожні 3 секунди (14 регістрів починаючи з 0x0020)
-  if (millis() - lastPoll > 3000) {
+
+  // 3. Почерговий запит стану станції кожні 10 секунд
+  if (millis() - lastPoll > 10000) {
     lastPoll = millis();
-    sendModbusRead(0x01, 0x03, 0x0020, 0x000E);
+    if (pollStep == 0) {
+      sendModbusRead(0x01, 0x03, 0x0020, 0x000E); // Базові параметри (28 байт)
+      pollStep = 1;
+    } else {
+      sendModbusRead(0x01, 0x03, 0x004A, 0x0006); // Вхідна напруга мережі (12 байт)
+      pollStep = 0;
+    }
   }
 }
